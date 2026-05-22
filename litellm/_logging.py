@@ -1,6 +1,7 @@
 import ast
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from logging import Formatter
@@ -26,6 +27,43 @@ def _redact_string(value: str) -> str:
     if not _ENABLE_SECRET_REDACTION:
         return value
     return redact_string(value)
+
+
+# ---- Key-name-based credential scrubbing ---------------------------------- #
+# Matches patterns like  api_key=sk-abc123  or  password: "hunter2"
+# in an assembled log string. Word-boundary lookbehind prevents partial
+# matches like "invalid_token=..." being caught by the id_token alternative.
+# "@" excluded from the value charset so "password=pass@hostname" does not
+# swallow the hostname into the redacted token.
+_SECRET_KEY_RE = re.compile(
+    r"(?i)"
+    r"(?<![a-zA-Z0-9_])"
+    r"(api[_\-]?key|secret[_\-]?key|access[_\-]?key|auth[_\-]?token|"
+    r"password|passwd|access[_\-]?token|refresh[_\-]?token|id[_\-]?token|"
+    r"credential|private[_\-]?key|encryption[_\-]?key|master[_\-]?key|"
+    r"redis[_\-]?password|client[_\-]?secret|aws[_\-]?secret|"
+    r"gcp[_\-]?key|litellm[_\-]?key)"
+    r'(["\']?\s*[:=]\s*["\']?)(?!-----)([^\s\'"@&,}\]]{6,})'
+)
+# Anchored variant used to detect whether a record attribute *name* is itself
+# a secret field (e.g. via logger.debug("msg", extra={"api_key": "..."})).
+_SECRET_KEY_NAME_RE = re.compile(
+    r"(?i)^(api[_\-]?key|secret[_\-]?key|access[_\-]?key|auth[_\-]?token|"
+    r"password|passwd|access[_\-]?token|refresh[_\-]?token|id[_\-]?token|"
+    r"credential|private[_\-]?key|encryption[_\-]?key|master[_\-]?key|"
+    r"redis[_\-]?password|client[_\-]?secret|aws[_\-]?secret|"
+    r"gcp[_\-]?key|litellm[_\-]?key)$"
+)
+_REDACTED = "[REDACTED]"
+
+
+def _scrub_secrets(text: str) -> str:
+    """Apply both value-shape redaction and key-name redaction to a string."""
+    text = _redact_string(text)
+    return _SECRET_KEY_RE.sub(lambda m: m.group(1) + m.group(2) + _REDACTED, text)
+
+
+# --------------------------------------------------------------------------- #
 
 
 def redact_secrets(value: str) -> str:
@@ -55,16 +93,20 @@ class SecretRedactionFilter(logging.Filter):
             return True
 
         try:
-            record.msg = _redact_string(record.getMessage())
+            record.msg = _scrub_secrets(record.getMessage())
             record.args = None
         except Exception:
             if isinstance(record.msg, str):
-                record.msg = _redact_string(record.msg)
+                record.msg = _scrub_secrets(record.msg)
+            # Always clear args in the fallback path: if getMessage() raised,
+            # leaving raw args in place causes handler.handleError() to write
+            # them to stderr (exposing secrets that weren't in the format string).
+            record.args = None
 
-        # Redact exception tracebacks
+        # Redact exception tracebacks using key-name + value-shape scrubbing.
         if record.exc_info and record.exc_info[1] is not None:
             try:
-                record.exc_text = _redact_string(
+                record.exc_text = _scrub_secrets(
                     self._formatter.formatException(record.exc_info)
                 )
             except Exception:
@@ -73,7 +115,7 @@ class SecretRedactionFilter(logging.Filter):
         # Redact extra fields passed via logger.debug("msg", extra={...})
         for key, value in list(record.__dict__.items()):
             if key not in _STANDARD_RECORD_ATTRS and isinstance(value, str):
-                setattr(record, key, _redact_string(value))
+                setattr(record, key, _scrub_secrets(value))
 
         return True
 
@@ -151,6 +193,42 @@ def _get_standard_record_attrs() -> frozenset:
 _STANDARD_RECORD_ATTRS = _get_standard_record_attrs()
 
 
+class CredentialScrubberFilter(logging.Filter):
+    """Logger-level filter that redacts credentials from every log record.
+
+    Calls ``getMessage()`` to assemble the complete formatted string *before*
+    applying the key-name regex, so patterns like ``encryption_key=%s`` are
+    caught even when the key name lives in the format string and the value
+    lives in ``record.args``.  ``record.args`` is always cleared afterward so
+    ``handler.handleError()`` can never write raw args to stderr.
+
+    Extra record attributes injected via ``logger.debug("msg", extra={...})``
+    are scrubbed through the same path.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not _ENABLE_SECRET_REDACTION:
+            return True
+        try:
+            record.msg = _scrub_secrets(record.getMessage())
+            record.args = None
+        except Exception:
+            if isinstance(record.msg, str):
+                record.msg = _scrub_secrets(record.msg)
+            # Clear args even on failure so handleError can't expose them.
+            record.args = None
+        for key, value in list(record.__dict__.items()):
+            if key not in _STANDARD_RECORD_ATTRS:
+                if isinstance(key, str) and _SECRET_KEY_NAME_RE.match(key) and value is not None:
+                    setattr(record, key, _REDACTED)
+                elif isinstance(value, str):
+                    setattr(record, key, _scrub_secrets(value))
+        return True
+
+
+_credential_scrubber = CredentialScrubberFilter()
+
+
 class JsonFormatter(Formatter):
     def __init__(self):
         super(JsonFormatter, self).__init__()
@@ -202,6 +280,7 @@ def _setup_json_exception_handlers(formatter):
     error_handler = logging.StreamHandler()
     error_handler.setFormatter(formatter)
     error_handler.addFilter(_secret_filter)
+    error_handler.addFilter(_credential_scrubber)
 
     # Setup excepthook for uncaught exceptions
     def json_excepthook(exc_type, exc_value, exc_traceback):
@@ -265,6 +344,14 @@ verbose_router_logger.addHandler(handler)
 verbose_proxy_logger.addHandler(handler)
 verbose_logger.addHandler(handler)
 
+# Register the logger-level credential scrubber on each named logger.
+# Running at logger level (before handler dispatch) means getMessage() is
+# called while args are still available, so key=value pairs that span
+# the format string and args tuple are caught by the key-name regex.
+verbose_logger.addFilter(_credential_scrubber)
+verbose_proxy_logger.addFilter(_credential_scrubber)
+verbose_router_logger.addFilter(_credential_scrubber)
+
 
 def _suppress_loggers():
     """Suppress noisy loggers at INFO level"""
@@ -322,6 +409,8 @@ def _initialize_loggers_with_handler(handler: logging.Handler):
         lg.handlers.clear()  # remove any existing handlers
         lg.addHandler(handler)  # add JSON formatter handler
         lg.propagate = False  # prevent bubbling to parent/root
+        if _credential_scrubber not in lg.filters:
+            lg.addFilter(_credential_scrubber)
 
 
 def _get_uvicorn_json_log_config():
