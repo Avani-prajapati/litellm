@@ -814,7 +814,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         except OpenAIError as e:
             raise e
         except Exception as e:
-            status_code: Final = getattr(e, "status_code", 500)
+            status_code: Final[int | None] = getattr(e, "status_code", None)
+            if status_code is None:
+                raise
             error_headers = getattr(e, "headers", None)
             error_text: Final = getattr(e, "text", str(e))
             error_response: Final = getattr(e, "response", None)
@@ -936,8 +938,10 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     raise e
                 # e.message
             except Exception as e:
+                status_code: int | None = getattr(e, "status_code", None)
+                if status_code is None:
+                    raise
                 exception_response = getattr(e, "response", None)
-                status_code = getattr(e, "status_code", 500)
                 exception_body = getattr(e, "body", None)
                 error_headers = getattr(e, "headers", None)
                 if error_headers is None and exception_response:
@@ -1120,12 +1124,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                             body=exception_body,
                         )
                     else:
-                        raise OpenAIError(
-                            status_code=500,
-                            message=f"{e}",
-                            headers=error_headers,
-                            body=exception_body,
-                        )
+                        raise
 
     def get_stream_options(self, stream_options: dict | None, api_base: str | None) -> dict:
         """
@@ -1245,7 +1244,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 additional_args={"complete_input_dict": data},
                 original_response=str(e),
             )
-            status_code: Final = getattr(e, "status_code", 500)
+            status_code: Final[int | None] = getattr(e, "status_code", None)
+            if status_code is None:
+                raise
             error_headers = getattr(e, "headers", None)
             error_text: Final = getattr(e, "text", str(e))
             error_response: Final = getattr(e, "response", None)
@@ -1331,7 +1332,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         except OpenAIError as e:
             raise e
         except Exception as e:
-            status_code: Final = getattr(e, "status_code", 500)
+            status_code: Final[int | None] = getattr(e, "status_code", None)
+            if status_code is None:
+                raise
             error_headers = getattr(e, "headers", None)
             error_text: Final = getattr(e, "text", str(e))
             error_response: Final = getattr(e, "response", None)
@@ -1500,7 +1503,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             if hasattr(e, "status_code"):
                 raise OpenAIError(status_code=getattr(e, "status_code", 500), message=str(e))
             else:
-                raise OpenAIError(status_code=500, message=str(e))
+                raise
 
     def audio_speech(
         self,

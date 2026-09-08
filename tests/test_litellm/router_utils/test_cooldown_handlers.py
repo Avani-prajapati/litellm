@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import litellm
 from litellm.router_utils.cooldown_handlers import (
     _get_deployment_cooldown_policy,
+    _is_cooldown_required,
     _resolve_allowed_fails_from_policy,
     _should_cooldown_based_on_deployment_policy,
     should_cooldown_based_on_allowed_fails_policy,
@@ -266,6 +267,37 @@ class TestShouldCooldownBasedOnDeploymentPolicy:
 
         call_kwargs = mock_sc.call_args[1]
         assert call_kwargs["cooldown_time_override"] is None
+
+
+class TestIsCooldownRequired:
+    """A deployment whose host merely refused the connection must not be cooled down;
+    a deployment that genuinely returned HTTP 500 must be. Both exceptions carry
+    status_code=500 (see litellm/exceptions.py), so the exception_str's
+    "APIConnectionError" marker is the only signal that tells them apart."""
+
+    def test_connection_error_is_not_cooled_down(self):
+        exc = litellm.APIConnectionError(message="Connection error.", llm_provider="openai", model="gpt-4")
+        assert (
+            _is_cooldown_required(
+                litellm_router_instance=MagicMock(),
+                model_id="dep-1",
+                exception_status=exc.status_code,
+                exception_str=str(exc),
+            )
+            is False
+        )
+
+    def test_genuine_internal_server_error_is_cooled_down(self):
+        exc = litellm.InternalServerError(message="server error", llm_provider="openai", model="gpt-4")
+        assert (
+            _is_cooldown_required(
+                litellm_router_instance=MagicMock(),
+                model_id="dep-1",
+                exception_status=exc.status_code,
+                exception_str=str(exc),
+            )
+            is True
+        )
 
 
 class TestShouldCooldownBasedOnAllowedFailsPolicy:
